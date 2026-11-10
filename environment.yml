@@ -1,0 +1,47 @@
+# Conda environment for cognitive-task-representations
+#
+# Create:   conda env create -f environment.yml
+# Update:   conda env update -f environment.yml --prune
+# Activate: conda activate cogtasks
+#
+# Conda installs only Python; everything else comes from pip in a single resolve,
+# so neurogym's version pins are respected and conda and pip don't fight over numpy.
+
+name: cogtasks
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      # Deep learning (the macOS arm64 wheel includes Apple-GPU "mps" support)
+      - torch
+
+      # Environments. neurogym 2.3 pins gymnasium 0.29, numpy 2.2 and matplotlib 3.10;
+      # the gymnasium pin is stated here too so removing neurogym never upgrades it silently.
+      - gymnasium==0.29.*
+      - neurogym
+
+      # Analysis and statistics
+      - numpy
+      - scipy
+      - pandas
+      - scikit-learn
+      - statsmodels
+
+      # Plotting
+      - matplotlib
+      - seaborn
+
+      # Notebooks
+      - jupyterlab
+      - ipykernel
+      - ipywidgets
+
+      # Utilities and testing
+      - tqdm
+      - pyyaml
+      - pytest
+
+      # This repo's own code (the cogreps package), installed in editable mode
+      - -e .

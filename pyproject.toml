@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cogreps"
+version = "0.1.0"
+description = "Cognitive task environments, RNN models and agents for studying task representations"
+requires-python = ">=3.10"
+# Dependencies are managed by environment.yml, so none are listed here.
+dependencies = []
+
+[tool.setuptools]
+packages = ["cogreps"]
+
+[tool.setuptools.package-data]
+cogreps = ["*.mplstyle"]
