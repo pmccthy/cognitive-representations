@@ -3,17 +3,23 @@ Train every RNN variant on the 2AFC reversal task and summarise how well each le
 Author: patrick.mccarthy@dpag.ox.ac.uk
 
 Run from the repo root, in the cogtasks environment:
-    python scripts/train_2afc_variants.py
-    python scripts/train_2afc_variants.py --n-updates 5000 --seeds 0 1 2
-    python scripts/train_2afc_variants.py --p-reward 0.8 --out results/2afc_variants_p0.8
+    python scripts/10_11_26_train_2afc_variants.py
+    python scripts/10_11_26_train_2afc_variants.py --n-updates 5000 --seeds 0 1 2
+    python scripts/10_11_26_train_2afc_variants.py --variants ff_history --n-back 1 2 4 8
+    python scripts/10_11_26_train_2afc_variants.py --p-reward 0.8 --out results/2afc_variants_p08
 
 Variants train in parallel, one per CPU core. Prints a summary table and saves, in --out:
-    task.json         the task settings used
-    summary.csv       one row per agent (variant x seed), plus the Bayes and Q-learning baselines
-    history.csv       reward and loss terms at every training update
-    test_trials.csv   every trial of the frozen-weight test sessions, for every agent
-    models/           trained weights, one file per agent
-Plot the results with scripts/plot_2afc_variants.py.
+    task.json           the task settings used
+    runs/<agent>_seed<n>/  one folder per trained agent: model.pt, summary.json,
+                        history.csv.gz (every training update), trials.csv.gz (test trials)
+    summary.csv         one row per agent (variant x seed), plus the Bayes and Q-learning baselines
+    history.csv.gz      all agents' training histories combined
+    test_trials.csv.gz  all agents' test trials combined (including the baselines)
+
+Resumable: agents whose folder in runs/ is complete are skipped, so an interrupted run can
+be restarted with the same command, and more seeds can be added to the same --out later.
+The combined files always cover every agent in runs/.
+Plot the results with scripts/10_11_26_plot_2afc_variants.py.
 """
 
 import argparse
@@ -91,17 +97,18 @@ def updates_to_learn(history, p_reward, window=50):
 
 # ---------------------------------------------------------------------- one training run
 
-def train_one(variant, seed, task, n_updates, batch_size, lr, out):
+def train_one(variant, seed, task, n_updates, batch_size, lr, out, n_back=None):
+    # Variants with a trial-history input are labelled by window length, e.g. ff_history_n4
+    name = variant if n_back is None else f"{variant}_n{n_back}"
     torch.set_num_threads(1)  # runs are parallel across processes instead
     start = time.time()
     make_env = partial(TwoAFC, **task)
-    agent = make_agent(variant, make_env(), seed=seed, lr=lr)
+    extra = {} if n_back is None else {"n_back": n_back}
+    agent = make_agent(variant, make_env(), seed=seed, lr=lr, **extra)
     history = train_rnn(agent, make_env, n_updates, batch_size, seed=seed * 1_000_000, log_every=0)
-    torch.save(agent.model.state_dict(), out / "models" / f"{variant}_seed{seed}.pt")
-
     reward, correct, inference, trials = evaluate(agent, task)
     summary = {
-        "agent": variant,
+        "agent": name,
         "seed": seed,
         "updates_to_learn": updates_to_learn(history, task["p_reward"]),
         "train_reward_last100": history.reward_per_trial.tail(100).mean(),
@@ -111,8 +118,21 @@ def train_one(variant, seed, task, n_updates, batch_size, lr, out):
         "minutes": (time.time() - start) / 60,
     }
     for table in (history, trials):
-        table["agent"], table["seed"] = variant, seed
-    return summary, history, trials
+        table["agent"], table["seed"] = name, seed
+
+    # Save everything for this agent in its own folder; summary.json last, marking it complete
+    run_dir = out / "runs" / f"{name}_seed{seed}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(agent.model.state_dict(), run_dir / "model.pt")
+    history.to_csv(run_dir / "history.csv.gz", index=False)
+    trials.to_csv(run_dir / "trials.csv.gz", index=False)
+    (run_dir / "summary.json").write_text(json.dumps(summary, default=float))
+    return summary
+
+
+def job_name(variant, seed, n_back):
+    name = variant if n_back is None else f"{variant}_n{n_back}"
+    return f"{name}_seed{seed}"
 
 
 # ---------------------------------------------------------------------- main
@@ -121,6 +141,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--variants", nargs="+", default=list(VARIANTS))
     parser.add_argument("--seeds", nargs="+", type=int, default=[0])
+    parser.add_argument("--n-back", nargs="+", type=int, default=[1, 2, 4, 8],
+                        help="history window lengths (trials) for variants with a history input")
     parser.add_argument("--n-updates", type=int, default=3000)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-3)
@@ -131,15 +153,18 @@ def main():
     parser.add_argument("--out", default="results/2afc_variants")
     args = parser.parse_args()
     out = Path(args.out)
-    (out / "models").mkdir(parents=True, exist_ok=True)
+    (out / "runs").mkdir(parents=True, exist_ok=True)
 
-    # The task every agent is trained and tested on
+    # The task every agent is trained and tested on (must match earlier runs in the same folder)
     task = dict(n_trials=args.n_trials, rule=None, p_reversal=args.p_reversal, p_reward=args.p_reward)
-    (out / "task.json").write_text(json.dumps(task, indent=2))
+    task_file = out / "task.json"
+    if task_file.exists() and json.loads(task_file.read_text()) != task:
+        raise SystemExit(f"{out} holds runs of a different task {task_file.read_text()}; use another --out")
+    task_file.write_text(json.dumps(task, indent=2))
 
     # Baselines: the ideal observer, and Q-learning (learning as it goes over the test sessions)
     env = TwoAFC(**task)
-    rows, histories, all_trials = [], [], []
+    rows, all_trials = [], []
     for name, agent in [("bayes (ideal)", BayesAgent(env, seed=0)),
                         ("q_learning", QLearner(env, alpha=0.3, beta=10, seed=0))]:
         reward, correct, inference, trials = evaluate(agent, task)
@@ -149,32 +174,48 @@ def main():
         all_trials.append(trials)
 
     # RNN variants, in parallel
-    jobs = [(v, s) for v in args.variants for s in args.seeds]
-    print(f"Training {len(jobs)} agents ({args.n_updates} updates each) on {args.workers} workers...")
-    with ProcessPoolExecutor(max_workers=min(args.workers, len(jobs))) as pool:
-        futures = [pool.submit(train_one, v, s, task, args.n_updates, args.batch_size, args.lr, out)
-                   for v, s in jobs]
-        for future in as_completed(futures):
-            summary, history, trials = future.result()
-            print(f"  done: {summary['agent']} (seed {summary['seed']}), "
-                  f"test reward {summary['test_reward']:.3f}, {summary['minutes']:.1f} min")
-            rows.append(summary)
-            histories.append(history)
-            all_trials.append(trials)
+    # One job per variant and seed, and per window length for variants with a history input
+    jobs = [(v, s, nb if "history" in VARIANTS[v].get("inputs", ()) else None)
+            for v in args.variants for s in args.seeds
+            for nb in (args.n_back if "history" in VARIANTS[v].get("inputs", ()) else [None])]
+    todo = [j for j in jobs if not (out / "runs" / job_name(*j) / "summary.json").exists()]
+    print(f"{len(jobs)} agents requested, {len(jobs) - len(todo)} already done. "
+          f"Training {len(todo)} ({args.n_updates} updates each) on {args.workers} workers...")
+    if todo:
+        with ProcessPoolExecutor(max_workers=min(args.workers, len(todo))) as pool:
+            futures = [pool.submit(train_one, v, s, task, args.n_updates, args.batch_size, args.lr, out, nb)
+                       for v, s, nb in todo]
+            for i, future in enumerate(as_completed(futures), 1):
+                summary = future.result()
+                print(f"  [{i}/{len(todo)}] {summary['agent']} (seed {summary['seed']}): "
+                      f"test P(correct) {summary['test_correct']:.3f}, {summary['minutes']:.1f} min",
+                      flush=True)
 
-    # Save and print
+    # Combine every completed agent in runs/ into the summary files
+    print("Combining results...")
+    histories = []
+    for run_dir in sorted((out / "runs").iterdir()):
+        if not (run_dir / "summary.json").exists():
+            continue  # incomplete (interrupted) run
+        rows.append(json.loads((run_dir / "summary.json").read_text()))
+        histories.append(pd.read_csv(run_dir / "history.csv.gz"))
+        all_trials.append(pd.read_csv(run_dir / "trials.csv.gz"))
     columns = ["agent", "seed", "updates_to_learn", "train_reward_last100",
                "test_reward", "test_correct", "test_inference", "minutes"]
     table = pd.DataFrame(rows, columns=columns)
     table.to_csv(out / "summary.csv", index=False)
-    pd.concat(histories).to_csv(out / "history.csv", index=False)
-    pd.concat(all_trials).to_csv(out / "test_trials.csv", index=False)
+    pd.concat(histories).to_csv(out / "history.csv.gz", index=False)
+    pd.concat(all_trials).to_csv(out / "test_trials.csv.gz", index=False)
 
     print(f"\nTask: {task}")
     print(f"Training: {args.n_updates} updates x {args.batch_size} episodes, lr {args.lr}")
     print(f"updates_to_learn: first update with smoothed reward > {LEARNED_LEVEL * task['p_reward']:.2f}"
           f" (= {LEARNED_LEVEL:.0%} correct; chance is 50%)\n")
-    print(table.round(3).to_string(index=False))
+    if table.seed.nunique() <= 5:
+        print(table.round(3).to_string(index=False))
+    else:
+        print(table[table.seed.isna()].drop(columns=["seed", "updates_to_learn",
+                                                     "train_reward_last100", "minutes"]).round(3).to_string(index=False))
 
     # Mean and spread across seeds, for the RNN variants
     rnn = table.dropna(subset=["seed"])
@@ -183,7 +224,7 @@ def main():
         print("\nAcross seeds (mean ± sd; updates_to_learn counts only seeds that learned):")
         print(stats.agg(["mean", "std"]).round(3).to_string())
         print(rnn.groupby("agent").updates_to_learn.apply(lambda x: f"{x.notna().sum()}/{len(x)} seeds learned").to_string())
-    print(f"\nSaved to {out}/  (plot with: python scripts/plot_2afc_variants.py)")
+    print(f"\nSaved to {out}/  (plot with: python scripts/10_11_26_plot_2afc_variants.py)")
 
 
 if __name__ == "__main__":
