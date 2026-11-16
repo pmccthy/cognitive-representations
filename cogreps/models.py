@@ -11,8 +11,15 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-# Recurrent core types, selected by name in the config
-CORES = {"rnn": nn.RNN, "gru": nn.GRU, "lstm": nn.LSTM}
+class NoCore(nn.Module):
+    """No recurrence: passes the input straight through, so the model is feedforward."""
+
+    def forward(self, x, h=None):
+        return x, None
+
+
+# Core types, selected by name in the config ("none" = feedforward control)
+CORES = {"rnn": nn.RNN, "gru": nn.GRU, "lstm": nn.LSTM, "none": NoCore}
 
 # Prediction targets the model can have heads for. Each head reads the RNN state and the
 # action just taken, (h_t, a_t), and predicts:
@@ -27,7 +34,7 @@ class ModelConfig:
     input_dim: int                     # length of the input vector (built by the agent)
     obs_dim: int                       # number of observation types
     n_actions: int
-    core: str = "gru"                  # "rnn", "gru" or "lstm"
+    core: str = "gru"                  # "rnn", "gru", "lstm" or "none" (feedforward)
     hidden_size: int = 64
     readout_hidden: int | None = 64    # None: linear policy/value off the RNN; int: one ReLU layer
     readout_obs: bool = False          # also feed the current observation to the readout
@@ -48,8 +55,12 @@ class RecurrentModel(nn.Module):
         self.cfg = cfg
         H = cfg.hidden_size
 
-        # Recurrent core
-        self.core = CORES[cfg.core](cfg.input_dim, H, batch_first=True)
+        # Recurrent core (or none: then the "hidden state" is just the input)
+        if cfg.core == "none":
+            self.core = NoCore()
+            H = cfg.input_dim
+        else:
+            self.core = CORES[cfg.core](cfg.input_dim, H, batch_first=True)
         if cfg.freeze_core:
             self.core.requires_grad_(False)
 

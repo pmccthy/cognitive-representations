@@ -148,7 +148,9 @@ class RNNAgent(Agent):
         model: dict of ModelConfig settings (everything except the sizes)
         weights: dict of loss weights, e.g. {"actor": 1, "critic": 0.05, "entropy": 0.05}
         inputs: which signals to feed the network, in order, from
-            "obs" (current observation), "prev_action", "prev_reward"
+            "obs" (current observation), "prev_action", "prev_reward", and
+            "history" (stimulus, choice and reward of each of the last n_back trials)
+        n_back: number of past trials in the "history" input
         gamma: discount factor for future reward (per step). 0 = each action is judged only
             by its immediate reward, which is all the 2AFC needs; tasks where reward comes
             after later steps (e.g. the two-step task) need gamma > 0
@@ -156,11 +158,13 @@ class RNNAgent(Agent):
     """
 
     def __init__(self, env, model, weights, inputs=("obs", "prev_action", "prev_reward"),
-                 gamma=0.0, lr=1e-3, seed=None):
+                 n_back=1, gamma=0.0, lr=1e-3, seed=None):
         # Sizes as plain ints (gymnasium stores them as numpy ints, which torch rejects)
         self.n_obs = int(env.observation_space.n)
         self.n_actions = int(env.action_space.n)
         self.inputs, self.weights, self.gamma = inputs, weights, gamma
+        self.n_back = n_back
+        self.trial_size = self.n_obs + self.n_actions + 1  # one past trial: stimulus, choice, reward
 
         # Which observations the agent's action counts on (the env ignores actions on OUTCOME)
         self.counts = torch.tensor([label != "OUTCOME" for label in env.OBSERVATIONS])
@@ -169,7 +173,8 @@ class RNNAgent(Agent):
             torch.manual_seed(seed)  # for the initial weights
         self.generator = torch.Generator().manual_seed(seed if seed is not None else 0)
 
-        sizes = {"obs": self.n_obs, "prev_action": self.n_actions, "prev_reward": 1}
+        sizes = {"obs": self.n_obs, "prev_action": self.n_actions, "prev_reward": 1,
+                 "history": n_back * self.trial_size}
         cfg = ModelConfig(input_dim=sum(sizes[k] for k in inputs),
                           obs_dim=self.n_obs, n_actions=self.n_actions, **model)
         self.model = RecurrentModel(cfg)
@@ -182,14 +187,33 @@ class RNNAgent(Agent):
         """One-hot encoding, where -1 (e.g. no previous action yet) gives all zeros."""
         return F.one_hot(x.clamp(min=0), n).float() * (x >= 0).unsqueeze(-1)
 
-    def build_input(self, obs, prev_action, prev_reward):
-        """Concatenate the chosen input signals. Arguments are tensors of the same shape."""
+    def build_input(self, obs, prev_action, prev_reward, history):
+        """Concatenate the chosen input signals.
+
+        obs, prev_action and prev_reward have the same shape ([batch] or [batch, time]);
+        history has two extra dimensions at the end, [..., n_back, trial_size].
+        """
         parts = {
-            "obs": self.one_hot(obs, self.n_obs),
-            "prev_action": self.one_hot(prev_action, self.n_actions),
-            "prev_reward": prev_reward.float().unsqueeze(-1),
+            "obs": lambda: self.one_hot(obs, self.n_obs),
+            "prev_action": lambda: self.one_hot(prev_action, self.n_actions),
+            "prev_reward": lambda: prev_reward.float().unsqueeze(-1),
+            "history": lambda: history.flatten(-2),
         }
-        return torch.cat([parts[k] for k in self.inputs], dim=-1)
+        return torch.cat([parts[k]() for k in self.inputs], dim=-1)
+
+    def empty_history(self, batch_size):
+        """History before any trials: all zeros."""
+        return torch.zeros(batch_size, self.n_back, self.trial_size)
+
+    def push_history(self, history, obs, action, reward, counts):
+        """Add this step to the front of the trial history if it was a choice (counts = True).
+
+        history: [batch, n_back, trial_size], most recent trial first; the oldest drops off.
+        """
+        trial = torch.cat([self.one_hot(obs, self.n_obs), self.one_hot(action, self.n_actions),
+                           reward.float().unsqueeze(-1)], dim=-1)
+        shifted = torch.cat([trial[:, None], history[:, :-1]], dim=1)
+        return torch.where(counts[:, None, None], shifted, history)
 
     # ---- step-by-step interface (evaluation, recording)
 
@@ -197,11 +221,12 @@ class RNNAgent(Agent):
         self.h = None
         self.prev_action = torch.tensor([-1])  # no previous action at the start
         self.prev_reward = torch.tensor([0.0])
+        self.history = self.empty_history(1)
 
     @torch.no_grad()
     def act(self, obs):
         obs = torch.tensor([obs])
-        x = self.build_input(obs, self.prev_action, self.prev_reward)[:, None]  # [1, 1, D]
+        x = self.build_input(obs, self.prev_action, self.prev_reward, self.history)[:, None]  # [1, 1, D]
         out = self.model(x, self.one_hot(obs, self.n_obs)[:, None], self.h)
         self.h = out["h"]
         self.last_hidden = out["hidden"][0, 0].numpy()
@@ -213,6 +238,8 @@ class RNNAgent(Agent):
         # (outcome step) is passed on as "no action" (-1), so the input only shows real choices.
         self.prev_action = torch.tensor([action if self.counts[obs] else -1])
         self.prev_reward = torch.tensor([float(reward)])
+        self.history = self.push_history(self.history, torch.tensor([obs]), torch.tensor([action]),
+                                         torch.tensor([float(reward)]), self.counts[[obs]])
 
     def record(self):
         return {"hidden": self.last_hidden}
@@ -220,12 +247,23 @@ class RNNAgent(Agent):
     # ---- batch training
 
     def sequence_inputs(self, batch):
-        """Inputs for whole episodes: step t sees a_{t-1} and r_{t-1} (none at t = 0)."""
+        """Inputs for whole episodes: step t sees a_{t-1} and r_{t-1} (none at t = 0),
+        and the trials completed before step t."""
         choices = torch.where(batch["mask"].bool(), batch["actions"], -1)  # ignored actions -> -1
         prev_action = torch.cat([torch.full_like(choices[:, :1], -1), choices[:, :-1]], dim=1)
         prev_reward = torch.cat([torch.zeros_like(batch["rewards"][:, :1]),
                                  batch["rewards"][:, :-1]], dim=1)
-        x = self.build_input(batch["obs"], prev_action, prev_reward)
+
+        # Trial history at each step, rebuilt exactly as it was while acting
+        history = self.empty_history(batch["obs"].shape[0])
+        histories = []
+        for t in range(batch["obs"].shape[1]):
+            histories.append(history)
+            history = self.push_history(history, batch["obs"][:, t], batch["actions"][:, t],
+                                        batch["rewards"][:, t], batch["mask"][:, t].bool())
+        history = torch.stack(histories, dim=1)  # [B, T, n_back, trial_size]
+
+        x = self.build_input(batch["obs"], prev_action, prev_reward, history)
         return x, self.one_hot(batch["obs"], self.n_obs)
 
     @torch.no_grad()
@@ -238,11 +276,12 @@ class RNNAgent(Agent):
         obs = torch.tensor([env.reset(seed=s)[0] for env, s in zip(envs, seeds)])
         prev_action = torch.full((len(envs),), -1)
         prev_reward = torch.zeros(len(envs))
+        history = self.empty_history(len(envs))
         h = None
         steps = {"obs": [], "next_obs": [], "actions": [], "rewards": [], "mask": []}
         done = False
         while not done:
-            x = self.build_input(obs, prev_action, prev_reward)[:, None]
+            x = self.build_input(obs, prev_action, prev_reward, history)[:, None]
             out = self.model(x, self.one_hot(obs, self.n_obs)[:, None], h)
             h = out["h"]
             actions = torch.multinomial(F.softmax(out["logits"][:, 0], -1), 1,
@@ -260,6 +299,7 @@ class RNNAgent(Agent):
 
             for key, value in zip(steps, (obs, next_obs, actions, rewards, counts.float())):
                 steps[key].append(value)
+            history = self.push_history(history, obs, actions, rewards, counts)
             obs, prev_reward = next_obs, rewards
             prev_action = torch.where(counts, actions, -1)  # ignored actions -> "no action"
 
