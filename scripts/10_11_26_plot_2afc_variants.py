@@ -5,6 +5,7 @@ Author: patrick.mccarthy@dpag.ox.ac.uk
 Run from the repo root:
     python scripts/10_11_26_plot_2afc_variants.py
     python scripts/10_11_26_plot_2afc_variants.py --results results/2afc_variants
+    python scripts/10_11_26_plot_2afc_variants.py --exclude ff_history --figures figures_no_ff
 
 Saves to <results>/figures/:
     learning_curves.png   reward per trial over training, for each RNN variant (mean over seeds)
@@ -13,6 +14,9 @@ Saves to <results>/figures/:
     reversals.png         correct choices and reward around reversals (frozen-weight test)
     reward_over_session.png  cumulative reward over a test session
     example_sessions.png  trial-by-trial behaviour of each agent in one test session
+    reversals_by_seed.png    P(correct) around reversals for each seed separately, one panel per variant
+    reversal_rasters.png     individual reversals, no averaging: every choice around 30 reversals,
+                             for a few example seeds of each agent
 """
 
 import argparse
@@ -24,7 +28,10 @@ import numpy as np
 import pandas as pd
 
 from cogreps.plotting import smooth, use_style
-from cogreps.variants import VARIANTS
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch
+
+from cogreps.variants import CORE_VARIANTS, VARIANTS
 
 BASELINES = ["bayes (ideal)", "q_learning"]
 BASELINE_STYLE = {"bayes (ideal)": dict(color="black", ls="--"),
@@ -32,8 +39,8 @@ BASELINE_STYLE = {"bayes (ideal)": dict(color="black", ls="--"),
 
 
 def agent_order(names):
-    """Baselines first, then variants in the order they're defined in variants.py."""
-    known = BASELINES + list(VARIANTS)
+    """Baselines first, then core variants in their listed order, then any other variants."""
+    known = BASELINES + CORE_VARIANTS + [v for v in VARIANTS if v not in CORE_VARIANTS]
     return [n for n in known if n in names] + sorted(set(names) - set(known))
 
 
@@ -114,8 +121,8 @@ def plot_test_summary(summary, style, path):
                 ax.axhline(value.iloc[0], lw=1.5, label=baseline, **style[baseline])
         ax.axhline(0.5, color="lightgrey", lw=1, zorder=0)  # chance
         ax.set_xticks(range(len(agents)), agents, rotation=40, ha="right", fontsize=13)
-        ax.set(ylabel=labels[measure], ylim=(0.4, 1.02))
-    np.atleast_1d(axes)[-1].legend(loc="lower right")
+        ax.set(ylabel=labels[measure], ylim=(0.4, 1.02), xlim=(-0.5, len(agents) - 0.5))
+    np.atleast_1d(axes)[-1].legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
     fig.savefig(path)
     plt.close(fig)
 
@@ -158,6 +165,74 @@ def plot_reversals(trials, style, path, p_reward, before=5, after=15):
         ax.axhline(chance, color="lightgrey", lw=1, zorder=0)
         ax.set(xlabel="Trials from reversal", ylabel=ylabel, ylim=(0, 1.02))
     axes[1].legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def plot_reversals_by_seed(trials, style, path, before=5, after=15):
+    """P(correct) around reversals, averaged within each seed only: one thin line per seed,
+    the mean across seeds in bold, and the ideal observer (dashed) for reference."""
+    x = np.arange(-before, after)
+    agents = [a for a in agent_order(trials.agent.unique()) if a not in BASELINES]
+    bayes = reversal_windows(trials[trials.agent == "bayes (ideal)"], before, after)["correct"]
+    n_cols = 3
+    n_rows = int(np.ceil(len(agents) / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.5 * n_cols, 4 * n_rows), sharex=True, sharey=True)
+    axes = np.atleast_1d(axes).ravel()
+    for ax, agent in zip(axes, agents):
+        data = trials[trials.agent == agent]
+        curves = []
+        for _, run in data.groupby("seed"):
+            windows = reversal_windows(run, before, after)["correct"]
+            if len(windows):
+                curves.append(windows.mean(0))
+        curves = np.array(curves)
+        alpha = min(0.6, 5 / len(curves))
+        for curve in curves:
+            ax.plot(x, curve, color=style[agent]["color"], lw=1, alpha=alpha)
+        ax.plot(x, curves.mean(0), color=style[agent]["color"], lw=3)
+        if len(bayes):
+            ax.plot(x, bayes.mean(0), lw=1.5, **style["bayes (ideal)"])
+        ax.axvline(-0.5, color="lightgrey", lw=1, zorder=0)
+        ax.axhline(0.5, color="lightgrey", lw=1, zorder=0)
+        ax.set_title(f"{agent} ({len(curves)} seeds)", fontsize=14)
+        ax.set_ylim(0, 1.02)
+    for ax in axes[len(agents):]:
+        ax.axis("off")
+    fig.supxlabel("Trials from reversal")
+    fig.supylabel("P(correct choice)")
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def plot_reversal_rasters(trials, path, n_events=30, n_seeds=3, before=5, after=15):
+    """Individual reversals, before any averaging. Each panel is one agent (one seed):
+    each row is one reversal, each column one trial, coloured by what happened."""
+    agents = agent_order(trials.agent.unique())
+    colours_by_outcome = ["#3a3a3a", "#f4a261", "#dcdcdc"]  # wrong, correct unrewarded, correct rewarded
+    cmap = ListedColormap(colours_by_outcome)
+    fig, axes = plt.subplots(len(agents), n_seeds, figsize=(4.2 * n_seeds, 3.2 * len(agents)),
+                             sharex=True, squeeze=False)
+    for row, agent in zip(axes, agents):
+        data = trials[trials.agent == agent]
+        seeds = sorted(data.seed.unique())[:n_seeds]
+        for ax, seed in zip(row, seeds):
+            windows = reversal_windows(data[data.seed == seed], before, after)
+            outcome = (windows["correct"] + windows["reward"])[:n_events]  # 0, 1 or 2
+            ax.imshow(outcome, cmap=cmap, vmin=0, vmax=2, aspect="auto", interpolation="nearest",
+                      extent=(-before - 0.5, after - 0.5, len(outcome) + 0.5, 0.5))
+            ax.axvline(-0.5, color="black", lw=1.5)  # the reversal
+            ax.set_title(agent if len(seeds) == 1 else f"{agent}, seed {int(seed)}", fontsize=12)
+            ax.set_yticks([])
+        for ax in row[len(seeds):]:
+            ax.axis("off")
+    for ax in axes[-1]:
+        ax.set_xlabel("Trials from reversal")
+    fig.supylabel(f"Individual reversals (first {n_events} per agent)")
+    labels = ["wrong", "correct, unrewarded", "correct, rewarded"]
+    fig.legend([Patch(color=c) for c in colours_by_outcome], labels, loc="upper center",
+               ncol=3, bbox_to_anchor=(0.5, 1.0), fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.985))
     fig.savefig(path)
     plt.close(fig)
 
@@ -216,14 +291,21 @@ def first_existing(folder, *names):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--results", default="results/2afc_variants")
+    parser.add_argument("--exclude", nargs="+", default=[],
+                        help="leave out agents whose name starts with any of these, e.g. ff_history")
+    parser.add_argument("--figures", default="figures", help="folder (inside --results) for the figures")
     args = parser.parse_args()
     results = Path(args.results)
-    figures = results / "figures"
+    figures = results / args.figures
     figures.mkdir(exist_ok=True)
 
+    def keep(table):
+        """Drop the excluded agents from a table."""
+        return table[~table.agent.str.startswith(tuple(args.exclude))] if args.exclude else table
+
     use_style()
-    summary = pd.read_csv(results / "summary.csv")
-    history = pd.read_csv(first_existing(results, "history.csv.gz", "history.csv"))
+    summary = keep(pd.read_csv(results / "summary.csv"))
+    history = keep(pd.read_csv(first_existing(results, "history.csv.gz", "history.csv")))
     style = colours(agent_order(summary.agent.unique()))
     task_path = results / "task.json"
     p_reward = json.loads(task_path.read_text())["p_reward"] if task_path.exists() else 1.0
@@ -233,9 +315,11 @@ def main():
     plot_test_summary(summary, style, figures / "test_summary.png")
     trials_path = first_existing(results, "test_trials.csv.gz", "test_trials.csv")
     if trials_path is not None:
-        trials = pd.read_csv(trials_path)
+        trials = keep(pd.read_csv(trials_path))
         trials["seed"] = trials.seed.fillna(0)  # baselines have no seed
         plot_reversals(trials, style, figures / "reversals.png", p_reward)
+        plot_reversals_by_seed(trials, style, figures / "reversals_by_seed.png")
+        plot_reversal_rasters(trials, figures / "reversal_rasters.png")
         plot_reward_over_session(trials, style, figures / "reward_over_session.png", p_reward)
         plot_example_sessions(trials, style, figures / "example_sessions.png")
     else:

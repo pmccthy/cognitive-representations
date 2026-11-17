@@ -37,7 +37,7 @@ import torch
 from cogreps.agents import BayesAgent, QLearner
 from cogreps.tasks import TwoAFC
 from cogreps.training import run_episode, train_rnn
-from cogreps.variants import VARIANTS, make_agent
+from cogreps.variants import CORE_VARIANTS, VARIANTS, make_agent
 
 # Chance is 50% correct choices. An agent counts as having learned once its reward per trial,
 # smoothed over 50 updates, passes what 60% correct would earn (0.6 x p_reward)
@@ -139,7 +139,8 @@ def job_name(variant, seed, n_back):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--variants", nargs="+", default=list(VARIANTS))
+    parser.add_argument("--variants", nargs="+", default=CORE_VARIANTS,
+                        help="variants to train (default: CORE_VARIANTS in cogreps/variants.py)")
     parser.add_argument("--seeds", nargs="+", type=int, default=[0])
     parser.add_argument("--n-back", nargs="+", type=int, default=[1, 2, 4, 8],
                         help="history window lengths (trials) for variants with a history input")
