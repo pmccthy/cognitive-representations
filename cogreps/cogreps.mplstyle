@@ -26,6 +26,9 @@ ytick.major.width:  1.2
 patch.linewidth:        0
 patch.force_edgecolor:  False
 
+# No padding between the data and the x-axis limits
+axes.xmargin:       0
+
 # Lines
 lines.linewidth:    2.0
 

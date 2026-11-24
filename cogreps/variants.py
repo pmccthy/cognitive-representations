@@ -10,9 +10,11 @@ Each variant is a set of settings for RNNAgent, not a class:
              without one use the learning rate the training script passes
 Add a variant by adding an entry; anything can be overridden when making an agent.
 
-Naming: pfc = the recurrent network; bg = a 64-unit hidden layer in the readout;
+Naming: pfc = the recurrent network; bg = a hidden layer in the readout (64 units unless a
+config or `model` argument sets readout_hidden; variants without one set readout_hidden=None);
 obs = the bg layer also gets the current observation; nextobs = the RNN is trained to
-predict the next observation; e2e = RL gradients reach the RNN (end to end). Without e2e
+predict the next observation; e2e = RL gradients reach the RNN (end to end); bp = Blanco-Pozo
+et al. (2024) sizes and learning rates; win30 = the RNN sees only the last 30 steps. Without e2e
 (or with "readout"), RL trains only the readout, so an RNN with no prediction loss gets no
 training at all and keeps its random initial weights.
 """
@@ -49,44 +51,44 @@ VARIANTS = {
     ## BG with current observation input
     # RL gradients backpropagated to RNN, no prediction loss
     "pfc_bg_obs_e2e_rl": dict(
-        model=dict(readout_hidden=64, readout_obs=True),
+        model=dict(readout_obs=True),
         weights=RL,
     ),
     # RL gradients backpropagated to RNN, next-observation prediction loss
     "pfc_nextobs_bg_obs_e2e_rl": dict(
-        model=dict(readout_hidden=64, readout_obs=True, predict=("obs",)),
+        model=dict(readout_obs=True, predict=("obs",)),
         weights={**RL, "obs": 1.0},
     ),
     # RL gradients not backpropagated to RNN, no prediction loss (RNN stays untrained)
     "pfc_bg_obs_rl": dict(
-        model=dict(readout_hidden=64, readout_obs=True, detach_readout=True),
+        model=dict(readout_obs=True, detach_readout=True),
         weights=RL,
     ),
     # RL gradients not backpropagated to RNN, next-observation prediction loss (Blanco-Pozo style)
     "pfc_nextobs_bg_obs_rl": dict(
-        model=dict(readout_hidden=64, readout_obs=True, detach_readout=True, predict=("obs",)),
+        model=dict(readout_obs=True, detach_readout=True, predict=("obs",)),
         weights={**RL, "obs": 1.0},
     ),
 
     ## BG without current observation input
     # RL gradients backpropagated to RNN, no prediction loss
     "pfc_bg_e2e_rl": dict(
-        model=dict(readout_hidden=64, readout_obs=False),
+        model=dict(readout_obs=False),
         weights=RL,
     ),
     # RL gradients backpropagated to RNN, next-observation prediction loss
     "pfc_nextobs_bg_e2e_rl": dict(
-        model=dict(readout_hidden=64, readout_obs=False, predict=("obs",)),
+        model=dict(readout_obs=False, predict=("obs",)),
         weights={**RL, "obs": 1.0},
     ),
     # RL gradients not backpropagated to RNN, no prediction loss (RNN stays untrained)
     "pfc_bg_rl": dict(
-        model=dict(readout_hidden=64, readout_obs=False, detach_readout=True),
+        model=dict(readout_obs=False, detach_readout=True),
         weights=RL,
     ),
     # RL gradients not backpropagated to RNN, next-observation prediction loss
     "pfc_nextobs_bg_rl": dict(
-        model=dict(readout_hidden=64, readout_obs=False, detach_readout=True, predict=("obs",)),
+        model=dict(readout_obs=False, detach_readout=True, predict=("obs",)),
         weights={**RL, "obs": 1.0},
     ),
 
@@ -101,10 +103,19 @@ VARIANTS = {
         lr=dict(lr=0.01, lr_bg=0.05),
     ),
 
+    # The same, with the RNN seeing only the last 30 steps at each step (paper: n_back = 30)
+    "pfc_nextobs_bg_obs_rl_bp_win30": dict(
+        model=dict(hidden_size=16, readout_hidden=10, readout_obs=True, detach_readout=True,
+                   predict=("obs",), window=30),
+        weights={**RL, "obs": 1.0},
+        inputs=("obs", "prev_action"),
+        lr=dict(lr=0.01, lr_bg=0.05),
+    ),
+
     ## Control: no recurrence. A feedforward network given the current stimulus and an
     # explicit window of the last n_back trials (set n_back when making the agent)
     "ff_history": dict(
-        model=dict(core="none", readout_hidden=64),
+        model=dict(core="none"),
         weights=RL,
         inputs=("obs", "history"),
     ),
