@@ -68,8 +68,9 @@ class QLearner(Agent):
         return {"Q": self.Q.copy()}
 
 
-class BayesAgent(Agent):
-    """Ideal observer for the TwoAFC: tracks the probability that each rule is in force.
+class TwoAFCInference(Agent):
+    """Bayesian inference for the TwoAFC (the ideal observer): tracks the probability that each
+    rule is in force.
 
     It knows the task's structure (the two rules, the reversal and reward probabilities) but
     never sees the true rule. After each choice it updates its belief with Bayes' rule given
@@ -135,6 +136,222 @@ class BayesAgent(Agent):
         return {"belief": self.belief}
 
 
+# ---------------------------------------------------------------------- two-step task agents
+#
+# Baselines for the two-step task: the model-free, model-based and Bayesian inference strategies
+# of Blanco-Pozo et al. (2024), Methods. Each gives a value to the two first-step choices (LEFT,
+# RIGHT) and samples its choice from a softmax of those values. Outside the CHOICE state there is
+# only one valid action (poke the lit port, or CENTER after an outcome), which all of them take.
+# They learn once per trial, on the step where the outcome is revealed, and are reset at the
+# start of each episode.
+
+OTHER = {"LEFT": "RIGHT", "RIGHT": "LEFT", "UP": "DOWN", "DOWN": "UP"}
+
+
+def sample_choice(values, beta, rng):
+    """LEFT or RIGHT, sampled from softmax(beta * value). values = {"LEFT": .., "RIGHT": ..}."""
+    p = softmax(np.array([values["LEFT"], values["RIGHT"]]), beta)
+    return ("LEFT", "RIGHT")[rng.choice(2, p=p)]
+
+
+def only_valid_action(env, obs):
+    """Outside CHOICE: poke the lit port, or CENTER after an outcome."""
+    state = env.OBSERVATIONS[obs]
+    port = state.removesuffix("-ACTIVE") if state.endswith("-ACTIVE") else "CENTER"
+    return env.ACTIONS.index(port)
+
+
+def is_outcome_step(env, obs, next_obs):
+    """True on the step where poking the lit port revealed the trial's outcome."""
+    return env.OBSERVATIONS[obs].endswith("-ACTIVE") and env.OBSERVATIONS[next_obs] in env.OUTCOMES
+
+
+def p_port(env, choice):
+    """P(second-step port | choice) under the task's transition rule."""
+    common = env.TRANSITIONS[env.transition_rule][choice]
+    return {common: env.p_common, OTHER[common]: 1 - env.p_common}
+
+
+class TwoStepModelFree(Agent):
+    """Model-free strategy: values each choice by the rewards that followed it.
+
+    After each trial (choice c, port s reached, reward r):
+        Q(c) <- (1 - alpha) Q(c) + alpha ((1 - lam) V(s) + lam r)
+        V(s) <- (1 - alpha) V(s) + alpha r
+    lam (the eligibility trace) sets whether Q(c) moves towards the reward itself (lam = 1) or
+    towards the value of the port reached (lam = 0). V(s) is used before its own update. The
+    transition structure is never used.
+
+    Asymmetric version (paper): alpha_neg is the learning rate after omissions (None = alpha),
+    and with forget > 0 the choice not made and the port not visited decay towards 0.5.
+
+    Defaults maximise reward on the two-step task with 20-40 trial blocks (grid search,
+    18/11/26; the optimum is flat, and beta is shared across the three baselines).
+    """
+
+    def __init__(self, env, alpha=0.8, beta=20.0, lam=1.0, alpha_neg=None, forget=0.0, seed=None):
+        self.env = env
+        self.alpha, self.beta, self.lam = alpha, beta, lam
+        self.alpha_neg = alpha if alpha_neg is None else alpha_neg
+        self.forget = forget
+        self.rng = np.random.default_rng(seed)
+
+    def reset(self):
+        self.Q = {"LEFT": 0.5, "RIGHT": 0.5}  # choice values
+        self.V = {"UP": 0.5, "DOWN": 0.5}     # second-step port values
+
+    def act(self, obs):
+        if self.env.OBSERVATIONS[obs] == "CHOICE":
+            self.choice = sample_choice(self.Q, self.beta, self.rng)
+            return self.env.ACTIONS.index(self.choice)
+        return only_valid_action(self.env, obs)
+
+    def observe(self, obs, action, reward, next_obs, done):
+        if not is_outcome_step(self.env, obs, next_obs):
+            return
+        c, s, r = self.choice, self.env.ACTIONS[action], float(reward)
+        a = self.alpha if r > 0 else self.alpha_neg
+        self.Q[c] = (1 - a) * self.Q[c] + a * ((1 - self.lam) * self.V[s] + self.lam * r)
+        self.V[s] = (1 - a) * self.V[s] + a * r
+
+        # Forgetting: what wasn't experienced this trial decays towards 0.5
+        self.Q[OTHER[c]] += self.forget * (0.5 - self.Q[OTHER[c]])
+        self.V[OTHER[s]] += self.forget * (0.5 - self.V[OTHER[s]])
+
+    def record(self):
+        return {"q_left": self.Q["LEFT"], "q_right": self.Q["RIGHT"],
+                "v_up": self.V["UP"], "v_down": self.V["DOWN"]}
+
+
+class TwoStepModelBased(Agent):
+    """Model-based strategy: learns each port's value and values each choice through the
+    known transition probabilities.
+
+    After each trial (port s reached, reward r):
+        V(s) <- (1 - alpha) V(s) + alpha r
+    and the choice values are
+        Q(c) = sum_s P(s | c) V(s)
+
+    Asymmetric version (paper): alpha_neg is the learning rate after omissions (None = alpha),
+    and with forget > 0 the port not visited decays towards forget_to (0.5 in the paper; 0 in
+    one of its variants).
+
+    Defaults maximise reward on the two-step task with 20-40 trial blocks (grid search,
+    18/11/26; the optimum is flat, and beta is shared across the three baselines).
+    """
+
+    def __init__(self, env, alpha=0.7, beta=20.0, alpha_neg=None, forget=0.0, forget_to=0.5, seed=None):
+        self.env = env
+        self.alpha, self.beta = alpha, beta
+        self.alpha_neg = alpha if alpha_neg is None else alpha_neg
+        self.forget, self.forget_to = forget, forget_to
+        self.rng = np.random.default_rng(seed)
+
+    def reset(self):
+        self.V = {"UP": 0.5, "DOWN": 0.5}  # second-step port values
+
+    def choice_values(self):
+        return {c: sum(p * self.V[s] for s, p in p_port(self.env, c).items()) for c in ("LEFT", "RIGHT")}
+
+    def act(self, obs):
+        if self.env.OBSERVATIONS[obs] == "CHOICE":
+            self.choice = sample_choice(self.choice_values(), self.beta, self.rng)
+            return self.env.ACTIONS.index(self.choice)
+        return only_valid_action(self.env, obs)
+
+    def observe(self, obs, action, reward, next_obs, done):
+        if not is_outcome_step(self.env, obs, next_obs):
+            return
+        s, r = self.env.ACTIONS[action], float(reward)
+        a = self.alpha if r > 0 else self.alpha_neg
+        self.V[s] = (1 - a) * self.V[s] + a * r
+        self.V[OTHER[s]] += self.forget * (self.forget_to - self.V[OTHER[s]])
+
+    def record(self):
+        Q = self.choice_values()
+        return {"q_left": Q["LEFT"], "q_right": Q["RIGHT"], "v_up": self.V["UP"], "v_down": self.V["DOWN"]}
+
+
+class TwoStepInference(Agent):
+    """Bayesian inference strategy for the two-step task: tracks the probability that UP is
+    the good port (the counterpart of TwoAFCInference).
+
+    It knows the task's structure (transition probabilities, reward probabilities, how often
+    the block switches) but never sees the true block. After each trial it updates its belief
+    with Bayes' rule given which port it reached and whether it was rewarded, then allows for a
+    possible block switch before the next trial. Choices are valued by their expected reward:
+        P(reward | s) = belief * P(reward | s, UP good) + (1 - belief) * P(reward | s, DOWN good)
+        Q(c) = sum_s P(s | c) P(reward | s)
+    `belief` = P(UP is the good port) is what networks could be decoded against.
+
+    Args (the true task parameters are used unless others are given):
+        p_reversal: probability that the block switches after a trial. From the task: 1 / mean
+            block length with block_len, otherwise its p_reversal (1/30 if neither is set). With
+            block_len this assumes a constant switch probability, so it can't use the block
+            timing (no switch in a block's first 20 trials) and isn't quite the ideal observer.
+        p_good, p_bad: reward probabilities at the good and bad port
+        beta: softmax inverse temperature. Reward is within 0.002 per trial of beta = 100 at
+            the default.
+        asymmetric: the paper's asymmetric version, in which omissions carry no information
+            about the block (it sees omission at either port as the same observation), so only
+            rewards update the belief
+    """
+
+    def __init__(self, env, p_reversal=None, p_good=None, p_bad=None, beta=20.0, asymmetric=False,
+                 seed=None):
+        self.env = env
+        if p_reversal is not None:
+            self.p_reversal = p_reversal
+        elif env.block_len is not None:
+            self.p_reversal = 2 / sum(env.block_len)  # 1 / mean block length
+        else:
+            self.p_reversal = env.p_reversal if env.p_reversal > 0 else 1 / 30
+        self.p_good = env.BLOCKS["UP"]["UP"] if p_good is None else p_good
+        self.p_bad = env.BLOCKS["UP"]["DOWN"] if p_bad is None else p_bad
+        self.beta, self.asymmetric = beta, asymmetric
+        self.rng = np.random.default_rng(seed)
+
+    def reset(self):
+        self.belief = 0.5  # P(UP is the good port) at the start of a session
+
+    def p_reward(self, port, good_port):
+        """P(reward at this port | which port is good)."""
+        return self.p_good if port == good_port else self.p_bad
+
+    def choice_values(self):
+        """Expected reward of each choice, given the belief."""
+        p_reward = {s: self.belief * self.p_reward(s, "UP") + (1 - self.belief) * self.p_reward(s, "DOWN")
+                    for s in ("UP", "DOWN")}
+        return {c: sum(p * p_reward[s] for s, p in p_port(self.env, c).items()) for c in ("LEFT", "RIGHT")}
+
+    def act(self, obs):
+        if self.env.OBSERVATIONS[obs] == "CHOICE":
+            self.choice = sample_choice(self.choice_values(), self.beta, self.rng)
+            return self.env.ACTIONS.index(self.choice)
+        return only_valid_action(self.env, obs)
+
+    def observe(self, obs, action, reward, next_obs, done):
+        if not is_outcome_step(self.env, obs, next_obs):
+            return
+        port, rewarded = self.env.ACTIONS[action], reward > 0
+
+        # 1) Bayes' rule: how likely was this outcome if UP were good, and if DOWN were good?
+        if rewarded or not self.asymmetric:
+            likelihood = {}
+            for good_port in ("UP", "DOWN"):
+                p = self.p_reward(port, good_port)
+                likelihood[good_port] = p if rewarded else 1 - p
+            numerator = self.belief * likelihood["UP"]
+            self.belief = numerator / (numerator + (1 - self.belief) * likelihood["DOWN"])
+
+        # 2) The block may switch before the next trial
+        self.belief = self.belief * (1 - self.p_reversal) + (1 - self.belief) * self.p_reversal
+
+    def record(self):
+        Q = self.choice_values()
+        return {"belief": self.belief, "q_left": Q["LEFT"], "q_right": Q["RIGHT"]}
+
+
 # ---------------------------------------------------------------------- recurrent agent
 
 class RNNAgent(Agent):
@@ -154,11 +371,19 @@ class RNNAgent(Agent):
         gamma: discount factor for future reward (per step). 0 = each action is judged only
             by its immediate reward, which is all the 2AFC needs; tasks where reward comes
             after later steps (e.g. the two-step task) need gamma > 0
-        lr: learning rate
+        lr: learning rate. With lr_bg set, this is the PFC learning rate only.
+        lr_bg: separate learning rate for the "BG" readout, as in Blanco-Pozo et al. (2024),
+            who trained PFC and BG with separate optimisers (lr 0.01 and 0.05). None = one
+            learning rate for the whole model. When set, the parameters are split in two:
+                PFC: the recurrent core and the prediction heads   (learning rate lr)
+                BG:  the readout layer and the policy and value heads   (learning rate lr_bg)
+            and gradients are clipped separately in each, so the two parts train as if they
+            had their own optimisers. (In variants without a readout layer, BG is just the
+            policy and value heads.)
     """
 
     def __init__(self, env, model, weights, inputs=("obs", "prev_action", "prev_reward"),
-                 n_back=1, gamma=0.0, lr=1e-3, seed=None):
+                 n_back=1, gamma=0.0, lr=1e-3, lr_bg=None, seed=None):
         # Sizes as plain ints (gymnasium stores them as numpy ints, which torch rejects)
         self.n_obs = int(env.observation_space.n)
         self.n_actions = int(env.action_space.n)
@@ -178,8 +403,22 @@ class RNNAgent(Agent):
         cfg = ModelConfig(input_dim=sum(sizes[k] for k in inputs),
                           obs_dim=self.n_obs, n_actions=self.n_actions, **model)
         self.model = RecurrentModel(cfg)
-        trainable = [p for p in self.model.parameters() if p.requires_grad]
-        self.optimizer = torch.optim.Adam(trainable, lr=lr)
+        self.lr, self.lr_bg = lr, lr_bg
+        self.optimizer = torch.optim.Adam(self.param_groups())
+
+    def param_groups(self):
+        """Trainable parameters for the optimiser: one group, or PFC and BG groups (see lr_bg)."""
+        def trainable(*modules):
+            return [p for m in modules for p in m.parameters() if p.requires_grad]
+
+        if self.lr_bg is None:
+            return [{"name": "all", "params": trainable(self.model), "lr": self.lr}]
+        m = self.model
+        groups = [{"name": "pfc", "params": trainable(m.core, m.pred), "lr": self.lr},
+                  {"name": "bg", "params": trainable(m.readout, m.policy, m.value), "lr": self.lr_bg}]
+        n_grouped = sum(len(g["params"]) for g in groups)
+        assert n_grouped == len(trainable(m)), "some trainable parameters are in neither PFC nor BG"
+        return [g for g in groups if g["params"]]  # e.g. no PFC parameters in the feedforward control
 
     # ---- inputs
 
@@ -270,7 +509,7 @@ class RNNAgent(Agent):
     def collect_episodes(self, envs, seeds):
         """Run one episode in each environment in parallel, sampling from the policy.
 
-        All episodes must have the same length (true for the TwoAFC). Returns a batch
+        All episodes must have the same length (true for the TwoAFC and TwoStepTask). Returns a batch
         of [n_envs, time] tensors in the format losses.py expects.
         """
         obs = torch.tensor([env.reset(seed=s)[0] for env, s in zip(envs, seeds)])
@@ -290,9 +529,9 @@ class RNNAgent(Agent):
             results = [env.step(int(a)) for env, a in zip(envs, actions)]
             next_obs = torch.tensor([r[0] for r in results])
             rewards = torch.tensor([r[1] for r in results], dtype=torch.float)
-            terminated = [r[2] for r in results]
-            assert all(terminated) or not any(terminated), "episodes must end together"
-            done = terminated[0]
+            ended = [r[2] or r[3] for r in results]  # terminated or truncated
+            assert all(ended) or not any(ended), "episodes must end together"
+            done = ended[0]
 
             # The action counts on stimulus steps; on outcome steps it is ignored
             counts = self.counts[obs]
@@ -319,6 +558,7 @@ class RNNAgent(Agent):
         loss = weighted_total(terms, self.weights)
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        for group in self.optimizer.param_groups:  # per part, so PFC and BG don't scale each other
+            torch.nn.utils.clip_grad_norm_(group["params"], 1.0)
         self.optimizer.step()
         return {name: float(value) for name, value in terms.items()}

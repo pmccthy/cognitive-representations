@@ -202,6 +202,8 @@ class TwoStepTask(gym.Env):
         self.ACTIONS = ["UP", "DOWN", "LEFT", "RIGHT", "CENTER"]
         self.OBSERVATIONS = ["CHOICE", "UP-ACTIVE", "DOWN-ACTIVE",
                              "REWARD-AT-UP", "REWARD-AT-DOWN", "NO-REWARD"]
+        # Observations that end a trial (reached by poking the active port); used to count trials
+        self.OUTCOMES = ["REWARD-AT-UP", "REWARD-AT-DOWN", "NO-REWARD"]
 
         # Transition rules: the port each choice commonly leads to
         self.TRANSITIONS = {

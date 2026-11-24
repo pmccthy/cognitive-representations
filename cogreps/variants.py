@@ -6,6 +6,8 @@ Each variant is a set of settings for RNNAgent, not a class:
     model:   ModelConfig settings (readout, gradient flow, prediction heads)
     weights: how much each loss term counts (terms left out are off)
     inputs:  (optional) which input signals the network gets
+    lr:      (optional) the variant's own learning rates, dict(lr=..., lr_bg=...); variants
+             without one use the learning rate the training script passes
 Add a variant by adding an entry; anything can be overridden when making an agent.
 
 Naming: pfc = the recurrent network; bg = a 64-unit hidden layer in the readout;
@@ -88,6 +90,17 @@ VARIANTS = {
         weights={**RL, "obs": 1.0},
     ),
 
+    ## Blanco-Pozo et al. (2024) settings: 16 GRU units, 10 ReLU units, inputs of the
+    # observation and previous action only (no previous reward), and separate PFC and BG
+    # learning rates (0.01 and 0.05)
+    "pfc_nextobs_bg_obs_rl_bp": dict(
+        model=dict(hidden_size=16, readout_hidden=10, readout_obs=True, detach_readout=True,
+                   predict=("obs",)),
+        weights={**RL, "obs": 1.0},
+        inputs=("obs", "prev_action"),
+        lr=dict(lr=0.01, lr_bg=0.05),
+    ),
+
     ## Control: no recurrence. A feedforward network given the current stimulus and an
     # explicit window of the last n_back trials (set n_back when making the agent)
     "ff_history": dict(
@@ -119,11 +132,16 @@ def make_agent(variant, env, model=None, weights=None, **kwargs):
 
     `model` and `weights` dicts update the variant's own settings, e.g.
     make_agent("pfc_rl", env, model={"hidden_size": 32}, seed=0)
-    Other keyword arguments (inputs, n_back, gamma, lr, seed) go straight to RNNAgent.
+    Other keyword arguments (inputs, n_back, gamma, lr, lr_bg, seed) go straight to RNNAgent.
+    A variant's own learning rates (its "lr" entry) take precedence over lr and lr_bg passed
+    here, so a training script's default learning rate doesn't overwrite them; pass
+    own_lr=False to use the rates given here instead.
     """
     spec = VARIANTS[variant]
     if "inputs" in spec:
         kwargs = {"inputs": spec["inputs"], **kwargs}
+    if kwargs.pop("own_lr", True) and "lr" in spec:
+        kwargs = {**kwargs, **spec["lr"]}
     return RNNAgent(env,
                     model={**spec["model"], **(model or {})},
                     weights={**spec["weights"], **(weights or {})},
