@@ -354,6 +354,15 @@ class TwoStepInference(Agent):
 
 # ---------------------------------------------------------------------- recurrent agent
 
+class TrainingDiverged(RuntimeError):
+    """Raised by RNNAgent.update when the loss or gradients stop being finite. The weights are
+    left as they were before that update. `terms` holds the loss terms at that point."""
+
+    def __init__(self, message, terms=None):
+        super().__init__(message)
+        self.terms = terms or {}
+
+
 class RNNAgent(Agent):
     """Agent built on a RecurrentModel, trained on batches of whole episodes.
 
@@ -380,14 +389,19 @@ class RNNAgent(Agent):
             and gradients are clipped separately in each, so the two parts train as if they
             had their own optimisers. (In variants without a readout layer, BG is just the
             policy and value heads.)
+        bootstrap: for episodes that are cut off rather than ended by the task, add the
+            estimated value of the state after the last step to the returns (as in
+            Blanco-Pozo et al. 2024), since the task would have gone on.
     """
 
     def __init__(self, env, model, weights, inputs=("obs", "prev_action", "prev_reward"),
-                 n_back=1, gamma=0.0, lr=1e-3, lr_bg=None, seed=None):
+                 n_back=1, gamma=0.0, lr=1e-3, lr_bg=None, bootstrap=False, seed=None):
         # Sizes as plain ints (gymnasium stores them as numpy ints, which torch rejects)
         self.n_obs = int(env.observation_space.n)
         self.n_actions = int(env.action_space.n)
         self.inputs, self.weights, self.gamma = inputs, weights, gamma
+        self.bootstrap = bootstrap
+        self.carry = None  # network state at the end of the last collection (continuing sessions)
         self.n_back = n_back
         self.trial_size = self.n_obs + self.n_actions + 1  # one past trial: stimulus, choice, reward
 
@@ -486,15 +500,16 @@ class RNNAgent(Agent):
     # ---- batch training
 
     def sequence_inputs(self, batch):
-        """Inputs for whole episodes: step t sees a_{t-1} and r_{t-1} (none at t = 0),
-        and the trials completed before step t."""
+        """Inputs for whole episodes: step t sees a_{t-1} and r_{t-1} and the trials completed
+        before step t. At t = 0 these come from batch["start"]: nothing at the start of a
+        session, or what came before when a session is continued."""
+        start = batch["start"]
         choices = torch.where(batch["mask"].bool(), batch["actions"], -1)  # ignored actions -> -1
-        prev_action = torch.cat([torch.full_like(choices[:, :1], -1), choices[:, :-1]], dim=1)
-        prev_reward = torch.cat([torch.zeros_like(batch["rewards"][:, :1]),
-                                 batch["rewards"][:, :-1]], dim=1)
+        prev_action = torch.cat([start["prev_action"][:, None], choices[:, :-1]], dim=1)
+        prev_reward = torch.cat([start["prev_reward"][:, None], batch["rewards"][:, :-1]], dim=1)
 
         # Trial history at each step, rebuilt exactly as it was while acting
-        history = self.empty_history(batch["obs"].shape[0])
+        history = start["history"]
         histories = []
         for t in range(batch["obs"].shape[1]):
             histories.append(history)
@@ -505,51 +520,85 @@ class RNNAgent(Agent):
         x = self.build_input(batch["obs"], prev_action, prev_reward, history)
         return x, self.one_hot(batch["obs"], self.n_obs)
 
+    def start_state(self, n):
+        """Network state and previous inputs at the start of a session (nothing yet)."""
+        return {"h": None, "prev_action": torch.full((n,), -1), "prev_reward": torch.zeros(n),
+                "history": self.empty_history(n)}
+
     @torch.no_grad()
-    def collect_episodes(self, envs, seeds):
+    def collect_episodes(self, envs, seeds, continue_session=False):
         """Run one episode in each environment in parallel, sampling from the policy.
 
-        All episodes must have the same length (true for the TwoAFC and TwoStepTask). Returns a batch
-        of [n_envs, time] tensors in the format losses.py expects.
+        Episodes may end at different steps: finished ones are padded to the length of the
+        longest and batch["valid"] marks the real steps. With continue_session=True the
+        environments aren't reset: each episode continues its session from where the previous
+        collection stopped, with the network's state and previous inputs carried over (as in
+        Blanco-Pozo et al. 2024). Returns [n_envs, time] tensors in the format losses.py
+        expects, plus:
+            start        network state and previous inputs at the first step
+            final_value  value of the state after each episode's last step (for bootstrapping)
+            truncated    whether each episode was cut off rather than ended by the task
         """
-        obs = torch.tensor([env.reset(seed=s)[0] for env, s in zip(envs, seeds)])
-        prev_action = torch.full((len(envs),), -1)
-        prev_reward = torch.zeros(len(envs))
-        history = self.empty_history(len(envs))
-        h = None
-        steps = {"obs": [], "next_obs": [], "actions": [], "rewards": [], "mask": []}
-        done = False
-        while not done:
+        n = len(envs)
+        if continue_session and self.carry is not None:
+            start = self.carry
+            obs = torch.tensor([env.reset(options={"continue": True})[0] for env in envs])
+        else:
+            start = self.start_state(n)
+            obs = torch.tensor([env.reset(seed=s)[0] for env, s in zip(envs, seeds)])
+        h, prev_action, prev_reward, history = (start["h"], start["prev_action"],
+                                                start["prev_reward"], start["history"])
+
+        active = torch.ones(n, dtype=torch.bool)      # episodes still running
+        truncated = torch.zeros(n, dtype=torch.bool)
+        steps = {"obs": [], "next_obs": [], "actions": [], "rewards": [], "mask": [], "valid": []}
+        while active.any():
             x = self.build_input(obs, prev_action, prev_reward, history)[:, None]
             out = self.model(x, self.one_hot(obs, self.n_obs)[:, None], h)
-            h = out["h"]
+            if not torch.isfinite(out["logits"]).all():
+                raise TrainingDiverged("non-finite network outputs while acting")
             actions = torch.multinomial(F.softmax(out["logits"][:, 0], -1), 1,
                                         generator=self.generator).squeeze(-1)
 
-            results = [env.step(int(a)) for env, a in zip(envs, actions)]
-            next_obs = torch.tensor([r[0] for r in results])
-            rewards = torch.tensor([r[1] for r in results], dtype=torch.float)
-            ended = [r[2] or r[3] for r in results]  # terminated or truncated
-            assert all(ended) or not any(ended), "episodes must end together"
-            done = ended[0]
+            # Step only the environments whose episode is still running
+            next_obs, rewards = obs.clone(), torch.zeros(n)
+            ended = torch.zeros(n, dtype=torch.bool)
+            for i in torch.flatten(torch.nonzero(active)).tolist():
+                o, r, terminated, cut_off, _ = envs[i].step(int(actions[i]))
+                next_obs[i], rewards[i] = o, r
+                ended[i], truncated[i] = terminated or cut_off, cut_off and not terminated
 
-            # The action counts on stimulus steps; on outcome steps it is ignored
-            counts = self.counts[obs]
+            # The action counts on stimulus steps (on outcome steps it is ignored) of running episodes
+            counts = self.counts[obs] & active
 
-            for key, value in zip(steps, (obs, next_obs, actions, rewards, counts.float())):
+            for key, value in zip(steps, (obs, next_obs, actions, rewards, counts.float(), active.float())):
                 steps[key].append(value)
-            history = self.push_history(history, obs, actions, rewards, counts)
-            obs, prev_reward = next_obs, rewards
-            prev_action = torch.where(counts, actions, -1)  # ignored actions -> "no action"
 
-        return {key: torch.stack(values, dim=1) for key, values in steps.items()}
+            # Finished episodes keep their final state and inputs (for continuing or bootstrapping)
+            h = self.model.select_state(~active, h, out["h"])
+            history = self.push_history(history, obs, actions, rewards, counts)
+            prev_reward = torch.where(active, rewards, prev_reward)
+            prev_action = torch.where(active, torch.where(counts, actions, -1), prev_action)
+            obs = next_obs
+            active &= ~ended
+
+        # Value of the state after each episode's last step (only needed for bootstrapping)
+        final_value = torch.zeros(n)
+        if self.bootstrap:
+            x = self.build_input(obs, prev_action, prev_reward, history)[:, None]
+            final_value = self.model(x, self.one_hot(obs, self.n_obs)[:, None], h)["value"][:, 0]
+
+        self.carry = {"h": h, "prev_action": prev_action, "prev_reward": prev_reward, "history": history}
+        batch = {key: torch.stack(values, dim=1) for key, values in steps.items()}
+        batch.update(start=start, final_value=final_value, truncated=truncated)
+        return batch
 
     def update(self, batch):
         """One gradient step on a batch of episodes. Returns the value of each loss term."""
         x, obs_onehot = self.sequence_inputs(batch)
-        out = self.model(x, obs_onehot)
+        out = self.model(x, obs_onehot, batch["start"]["h"])  # carried state when continuing
 
-        terms = actor_critic_losses(out, batch, self.gamma)
+        terms = actor_critic_losses(out, batch, self.gamma, self.bootstrap)
         if self.model.pred:
             action_onehot = self.one_hot(batch["actions"], self.n_actions)
             terms.update(prediction_losses(self.model.predictions(out["hidden"], action_onehot),
@@ -558,7 +607,21 @@ class RNNAgent(Agent):
         loss = weighted_total(terms, self.weights)
         self.optimizer.zero_grad()
         loss.backward()
+        values = {name: float(value.detach()) for name, value in terms.items()}
+
+        # Stop before a non-finite loss or gradient reaches the weights (training has diverged)
+        bad = [name for name, p in self.model.named_parameters()
+               if p.grad is not None and not torch.isfinite(p.grad).all()]
+        if not torch.isfinite(loss) or bad:
+            self.optimizer.zero_grad()
+            sizes = {"max_abs_logit": float(out["logits"].detach().abs().max()),
+                     "max_abs_value": float(out["value"].detach().abs().max()),
+                     "max_abs_hidden": float(out["hidden"].detach().abs().max()),
+                     "max_abs_weight": max(float(p.detach().abs().max()) for p in self.model.parameters())}
+            raise TrainingDiverged(f"non-finite loss or gradients (loss terms {values}; "
+                                   f"non-finite gradients in {bad or 'none'}; sizes {sizes})", values)
+
         for group in self.optimizer.param_groups:  # per part, so PFC and BG don't scale each other
             torch.nn.utils.clip_grad_norm_(group["params"], 1.0)
         self.optimizer.step()
-        return {name: float(value) for name, value in terms.items()}
+        return values

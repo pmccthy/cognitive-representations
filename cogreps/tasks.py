@@ -161,8 +161,13 @@ class TwoStepTask(gym.Env):
         3. Outcome:         REWARD-AT-UP, REWARD-AT-DOWN or NO-REWARD is shown; poking CENTER
                             starts the next trial.
     Any other action leaves the state unchanged and earns nothing, so a trial can take more than
-    three steps. Episodes start in NO-REWARD (which doubles as the "poke CENTER to start" state)
-    and are truncated after n_steps, so every episode in a batch has the same length.
+    three steps. Sessions start in NO-REWARD (which doubles as the "poke CENTER to start" state).
+
+    Episodes are cut off (truncated) after n_steps steps, or earlier once n_trials trials have
+    been completed, if n_trials is set. reset() starts a new session; reset(options={"continue":
+    True}) starts a new episode of the same session instead, keeping the block, the transition
+    rule, the current state and the trial count, as in Blanco-Pozo et al. (2024), whose
+    episodes are 100-trial chunks of one continuous session.
 
     Two hidden variables (never in the observation):
         transition rule: which port each choice commonly leads to. Fixed in Blanco-Pozo et al.;
@@ -173,11 +178,13 @@ class TwoStepTask(gym.Env):
             or whenever switch_block() / set_block() is called from outside.
     """
 
-    def __init__(self, n_steps=300, transition_rule=0, p_common=0.8, block=None,
+    def __init__(self, n_steps=300, n_trials=None, transition_rule=0, p_common=0.8, block=None,
                  p_good=0.8, p_bad=0.2, p_reversal=0.0, block_len=None, p_neutral=0.0):
         """
         Args:
-            n_steps (int): Timesteps per episode (a trained agent needs ~3 per trial).
+            n_steps (int): Maximum timesteps per episode (a trained agent needs ~3 per trial).
+            n_trials (int or None): End the episode once this many trials have been completed
+                (at the outcome of the last one). None: episodes always last n_steps.
             transition_rule (int or None): 0 = LEFT->UP, RIGHT->DOWN commonly; 1 = the reverse.
                 None samples one per episode.
             p_common (float): Probability of the common transition.
@@ -224,6 +231,7 @@ class TwoStepTask(gym.Env):
 
         # Task parameters
         self.n_steps = n_steps
+        self.n_trials = n_trials
         self.initial_transition_rule = transition_rule
         self.p_common = p_common
         self.initial_block = block
@@ -233,9 +241,19 @@ class TwoStepTask(gym.Env):
 
     #---------------------- gym.Env interface --------------------------------------
     def reset(self, seed=None, options=None):
-        """Start a new episode: sample its transition rule and block, then wait for CENTER."""
+        """Start a new session: sample its transition rule and block, then wait for CENTER.
+
+        With options={"continue": True}, start a new episode of the current session instead:
+        only the episode's step and trial counts restart (the seed is ignored).
+        """
+        if options and options.get("continue"):
+            if not hasattr(self, "state"):
+                raise RuntimeError("no session to continue: call reset() without options first")
+            self.step_n, self.episode_trials = 0, 0
+            return self.observation, self._info()
+
         super().reset(seed=seed)  # seeds self.np_random
-        self.step_n = 0
+        self.step_n, self.episode_trials = 0, 0
         self.trial = -1  # becomes 0 when the first trial is started
 
         # Transition rule: fixed, or random per episode
@@ -274,6 +292,7 @@ class TwoStepTask(gym.Env):
                 self.rewarded = bool(self.np_random.random() < self.reward_probs[action])
                 reward = float(self.rewarded)
                 self.state = f"REWARD-AT-{action}" if self.rewarded else "NO-REWARD"
+                self.episode_trials += 1
 
         else:
             # Outcome (or episode start): CENTER starts the next trial
@@ -281,9 +300,11 @@ class TwoStepTask(gym.Env):
                 self._start_trial()
 
         # Any action not handled above leaves the state unchanged and earns nothing.
-        # Episodes are cut off after n_steps (truncated, not terminated: the task itself goes on)
+        # Episodes are cut off after n_steps, or n_trials completed trials (truncated, not
+        # terminated: the task itself goes on)
         self.step_n += 1
-        truncated = self.step_n >= self.n_steps
+        truncated = self.step_n >= self.n_steps or (
+            self.n_trials is not None and self.episode_trials >= self.n_trials)
         return self.observation, reward, False, truncated, self._info()
 
     # ----------------------- task logic -------------------------------------------
